@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading Platform v1 – Multi Bot (Signal, Grid, Funding, DCA)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/trading
+ExecStart=/usr/bin/python3 /home/pi/trading/platform.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:/home/pi/trading/platform.log
+StandardError=append:/home/pi/trading/platform.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
