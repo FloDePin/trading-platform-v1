@@ -35,7 +35,6 @@ Runs up to 4 automated trading bots simultaneously, each on its own Bitget sub-a
 - Per-bot PnL sparklines and status
 - Open positions across all sub-accounts
 - Market tab: live prices for 15+ coins
-- Yields tab: DeFi opportunities from DefiLlama
 - Economic Calendar with Finnhub
 - Trade History with win rate summary
 - Backtesting: up to 730 days, walk-forward, Sharpe ratio, fee-adjusted
@@ -85,7 +84,6 @@ Dashboard at `http://your-server-ip:5000`
 | Discord | Alerts + Daily Summary | Yes | Webhook URL |
 | CoinGecko | News Sentiment | Yes | No |
 | Alternative.me | Fear & Greed | Yes | No |
-| DefiLlama | Yield Opportunities | Yes | No |
 
 ---
 
@@ -144,7 +142,7 @@ Copyright (c) 2026 Trading Platform Contributors
 
 Before running the Grid Bot, you **must** switch your Bitget sub-account from Hedge Mode to **One-Way Mode**.
 
-**Why:** Bitget Futures defaults to Hedge Mode (simultaneous long and short allowed). In Hedge Mode, the Grid Bot's sell orders open new short positions instead of closing existing longs. This causes uncontrolled leveraged positions in both directions.
+**Why:** Bitget Futures defaults to Hedge Mode (simultaneous long and short allowed). In Hedge Mode, the Grid Bot's sell orders open new short positions instead of closing existing longs. This ca[...]
 
 **How to switch:**
 1. Open Bitget App or website
@@ -161,7 +159,7 @@ Currently, the platform is built exclusively for **Bitget** (Futures + Spot). Th
 
 ### Adding More Exchanges (Roadmap)
 
-The platform is designed so that the `BitgetClient` class can be replaced with a universal exchange wrapper using [CCXT](https://github.com/ccxt/ccxt) – a Python library that supports 100+ exchanges with a unified API interface.
+The platform is designed so that the `BitgetClient` class can be replaced with a universal exchange wrapper using [CCXT](https://github.com/ccxt/ccxt) – a Python library that supports 100+ exch[...]
 
 Planned exchanges for future support:
 
