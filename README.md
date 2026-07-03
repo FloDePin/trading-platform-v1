@@ -94,6 +94,16 @@ Dashboard at `http://your-server-ip:5000`
 - **API keys: Read + Trade only.** Never enable Withdraw.
 - **Do not expose port 5000 publicly** without restricting access.
 - **`platform_config.json` contains API keys.** It is gitignored – never commit it.
+- **`platform.log` contains the auto-generated dashboard password once, at first start.** It is gitignored too – treat it with the same care as the config file.
+
+### Dashboard login
+The dashboard is protected with HTTP Basic Auth. On first start, a random password is
+generated automatically and printed once to the console/`platform.log`:
+```
+Dashboard-Zugang erstellt: user='admin' password='<random>'
+```
+Your browser will prompt for these credentials on the first visit. Change them anytime
+under **Settings → Dashboard-Zugang**.
 
 ### Restrict dashboard access
 ```bash

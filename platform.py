@@ -5,7 +5,7 @@ Bitget Sub-Account Support | Demo & Live
 """
 
 import time, json, hmac, hashlib, base64, logging, requests
-import urllib.parse, threading, os, math, sqlite3, sys
+import urllib.parse, threading, os, math, sqlite3, sys, secrets, uuid
 import signal as _signal
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
@@ -133,6 +133,8 @@ DEFAULT_CONFIG = {
     "telegram_token":  "",
     "telegram_chat_id":"",
     "discord_webhook": "",
+    "dashboard_user":     "admin",
+    "dashboard_password": "",
     "alerts":          [],
     "grid_instances":  [],
     "bots": {
@@ -172,21 +174,35 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    if not os.path.exists(CONFIG_FILE):
+    is_new = not os.path.exists(CONFIG_FILE)
+    if is_new:
+        data = DEFAULT_CONFIG.copy()
+    else:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        # Ensure top-level defaults exist
+        for k, v in DEFAULT_CONFIG.items():
+            if k != "bots":
+                data.setdefault(k, v)
+        for k, v in DEFAULT_CONFIG["bots"].items():
+            data.setdefault("bots", {}).setdefault(k, {})
+            for field, default in v.items():
+                data["bots"][k].setdefault(field, default)
+
+    needs_save = is_new
+    if not data.get("dashboard_password"):
+        data["dashboard_password"] = secrets.token_urlsafe(12)
+        needs_save = True
+        log.warning("="*55)
+        log.warning(f"  Dashboard-Zugang erstellt: user='{data.get('dashboard_user','admin')}' "
+                    f"password='{data['dashboard_password']}'")
+        log.warning("  Bitte merken/aendern (Settings -> Dashboard-Zugang).")
+        log.warning("="*55)
+    if needs_save:
         with open(CONFIG_FILE, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        log.info(f"Config erstellt: {CONFIG_FILE}")
-        return DEFAULT_CONFIG.copy()
-    with open(CONFIG_FILE) as f:
-        data = json.load(f)
-    # Ensure top-level defaults exist
-    for k, v in DEFAULT_CONFIG.items():
-        if k != "bots":
-            data.setdefault(k, v)
-    for k, v in DEFAULT_CONFIG["bots"].items():
-        data.setdefault("bots", {}).setdefault(k, {})
-        for field, default in v.items():
-            data["bots"][k].setdefault(field, default)
+            json.dump(data, f, indent=2)
+        if is_new:
+            log.info(f"Config erstellt: {CONFIG_FILE}")
     return data
 
 def save_config(cfg):
@@ -235,6 +251,11 @@ class BitgetClient:
         return {}
 
     def post(self, path, body: dict, retries=3):
+        # clientOid macht Order-Platzierungen idempotent: schlaegt eine Order-Response
+        # durch Timeout/Netzwerkfehler fehl obwohl Bitget sie bereits angenommen hat,
+        # verhindert der gleichbleibende clientOid beim Retry eine Dopplung der Order.
+        if "place-order" in path and "clientOid" not in body:
+            body = {**body, "clientOid": uuid.uuid4().hex}
         for attempt in range(retries):
             try:
                 b  = json.dumps(body)
@@ -924,7 +945,9 @@ def alert_check_thread():
                     elif atype == "pnl_below":
                         val = float(a.get("value", -50))
                         with plock:
-                            total = sum(pstate["bots"][b].get("pnl",0) for b in pstate["bots"])
+                            # Funding Bot handelt nicht real - Schaetzung zaehlt nicht in den Alert
+                            total = sum(pstate["bots"][b].get("pnl",0)
+                                        for b in pstate["bots"] if b != "funding")
                         if total < val and not a.get("triggered"):
                             _alert_note(f"Gesamt-PnL unter {val} USDT (aktuell {total:.2f})")
                             a["triggered"] = True; dirty = True
@@ -981,6 +1004,7 @@ pstate = {
     "live_mode": False,
 }
 plock            = threading.Lock()
+_start_lock      = threading.Lock()  # verhindert Race-Condition bei doppeltem Bot-Start
 bot_threads      = {}
 bot_flags        = {}
 grid_inst_threads = {}
@@ -1104,7 +1128,9 @@ def run_signal(flag):
             if start_bal > 0 and pct <= -0.02:
                 blog("signal","Tageslimit erreicht. Pause 1h.","WARN")
                 with plock: pstate["bots"]["signal"]["status"] = "PAUSED"
-                time.sleep(3600)
+                pause_until = time.time() + 3600
+                while time.time() < pause_until and not flag["stop"]:
+                    time.sleep(5)
                 with plock: pstate["bots"]["signal"]["status"] = "RUNNING"
                 continue
 
@@ -1219,21 +1245,6 @@ def run_signal(flag):
 
                     if pos:
                         ps = "LONG" if pos["holdSide"]=="long" else "SHORT"
-                        # Prüfe ob Position durch SL/TP geschlossen wurde
-                        prev_pos = pstate["bots"]["signal"]["tokens"][sym].get("_last_pos")
-                        if prev_pos and not pos:
-                            entry = float(prev_pos.get("openPriceAvg",0))
-                            upnl  = float(pos.get("unrealizedPL",0))
-                            if upnl > 0:
-                                win_streak += 1; loss_streak = 0
-                                db_save_trade("signal", cur, ps, entry, 0, upnl*(1-fee_rate))
-                            else:
-                                loss_streak += 1; win_streak = 0
-                                db_save_trade("signal", cur, ps, entry, 0, upnl*(1+fee_rate))
-                            with plock:
-                                pstate["bots"]["signal"].update({
-                                    "win_streak":win_streak, "loss_streak":loss_streak})
-
                         if (ps=="LONG" and sig=="SHORT") or (ps=="SHORT" and sig=="LONG"):
                             client.post("/api/v2/mix/order/place-order", {
                                 "symbol":sym,"productType":PRODUCT_TYPE,
@@ -1246,6 +1257,23 @@ def run_signal(flag):
                             blog("signal",f"{cur}: Position gedreht","TRADE")
                             if not blackout: _open(sig)
                     else:
+                        # Pruefe ob eine zuvor offene Position seit dem letzten Zyklus
+                        # durch SL/TP (oder manuell) geschlossen wurde
+                        prev_pos = pstate["bots"]["signal"]["tokens"][sym].get("_last_pos")
+                        if prev_pos:
+                            ps    = "LONG" if prev_pos["holdSide"]=="long" else "SHORT"
+                            entry = float(prev_pos.get("openPriceAvg",0))
+                            upnl  = float(prev_pos.get("unrealizedPL",0))
+                            if upnl > 0:
+                                win_streak += 1; loss_streak = 0
+                                db_save_trade("signal", cur, ps, entry, 0, upnl*(1-fee_rate))
+                            else:
+                                loss_streak += 1; win_streak = 0
+                                db_save_trade("signal", cur, ps, entry, 0, upnl*(1+fee_rate))
+                            with plock:
+                                pstate["bots"]["signal"].update({
+                                    "win_streak":win_streak, "loss_streak":loss_streak})
+                            open_pos_count = max(0, open_pos_count - 1)
                         if sig in ("LONG","SHORT") and not blackout:
                             _open(sig)
                     with plock:
@@ -1290,6 +1318,7 @@ def run_grid(flag):
     qty_lvl = (invest / n) / ((upper + lower) / 2)
     filled  = [False] * (n + 1)
     pnl     = 0.0
+    net_qty = 0.0  # aktuell durch diesen Grid-Bot gehaltene Long-Menge (lokale Buchhaltung)
 
     with plock:
         pstate["bots"]["grid"].update({
@@ -1307,20 +1336,38 @@ def run_grid(flag):
             for i, level in enumerate(levels):
                 if abs(px - level) / level < 0.002 and not filled[i]:
                     filled[i] = True
-                    side       = "BUY" if px <= (upper+lower)/2 else "SELL"
-                    order_side = "buy" if side == "BUY" else "sell"
-                    qty_str    = fmt_q(sym, qty_lvl)
+                    side = "BUY" if px <= (upper+lower)/2 else "SELL"
+
+                    if side == "SELL" and net_qty <= 0:
+                        # Kein offener Bestand aus diesem Grid zum Verkaufen -
+                        # Level wird uebersprungen statt einen naked Short zu eroeffnen
+                        with plock:
+                            pstate["bots"]["grid"]["grid_orders"][i]["filled"] = True
+                        blog("grid",f"Grid SELL @ {level:.2f} [Level {i+1}/{n}] uebersprungen - kein offener Bestand","WARN")
+                        continue
+
+                    if side == "BUY":
+                        order_side, trade_side = "buy", "open"
+                        qty_trade = qty_lvl
+                    else:
+                        order_side, trade_side = "sell", "close"
+                        qty_trade = min(qty_lvl, net_qty)
+                    qty_str = fmt_q(sym, qty_trade)
                     # Market-Order: sofortige Ausfuehrung zum aktuellen Preis,
                     # kein Risiko dass der Wick vorbei ist bevor die Limit-Order greift
                     resp = client.post("/api/v2/mix/order/place-order", {
                         "symbol": sym, "productType": PRODUCT_TYPE,
                         "marginMode":"isolated","marginCoin":MARGIN_COIN,
                         "size": qty_str, "side": order_side,
-                        "tradeSide":"open","orderType":"market","force":"ioc",
+                        "tradeSide": trade_side, "orderType":"market","force":"ioc",
                     })
                     ok = resp.get("code") == "00000"
-                    if ok and side == "SELL":
-                        pnl += qty_lvl * step
+                    if ok:
+                        if side == "BUY":
+                            net_qty += qty_lvl
+                        else:
+                            pnl     += qty_trade * step
+                            net_qty  = max(0.0, net_qty - qty_trade)
                     with plock:
                         pstate["bots"]["grid"]["grid_orders"][i]["filled"] = True
                         pstate["bots"]["grid"]["filled"]      = sum(filled)
@@ -1386,6 +1433,7 @@ def run_grid_instance(flag, inst_cfg, inst_id):
     qty_l  = (invest / n) / ((upper + lower) / 2)
     filled = [False] * (n+1)
     pnl    = 0.0
+    net_qty = 0.0  # aktuell durch diese Grid-Instanz gehaltene Long-Menge (lokale Buchhaltung)
 
     with plock:
         pstate["grid_instances"][inst_id].update({
@@ -1405,16 +1453,35 @@ def run_grid_instance(flag, inst_cfg, inst_id):
             for i, level in enumerate(levels):
                 if abs(px - level) / level < 0.002 and not filled[i]:
                     filled[i]  = True
-                    order_side = "buy" if px <= (upper+lower)/2 else "sell"
-                    side_label = "BUY" if order_side=="buy" else "SELL"
+                    side_label = "BUY" if px <= (upper+lower)/2 else "SELL"
+
+                    if side_label == "SELL" and net_qty <= 0:
+                        with plock:
+                            gi = pstate["grid_instances"].get(inst_id,{})
+                            if "grid_orders" in gi and i < len(gi["grid_orders"]):
+                                gi["grid_orders"][i]["filled"] = True
+                        _ilog(inst_id, name, f"Grid SELL @ {level:.2f} L{i+1}/{n} uebersprungen - kein offener Bestand","WARN")
+                        continue
+
+                    if side_label == "BUY":
+                        order_side, trade_side = "buy", "open"
+                        qty_trade = qty_l
+                    else:
+                        order_side, trade_side = "sell", "close"
+                        qty_trade = min(qty_l, net_qty)
                     resp = client.post("/api/v2/mix/order/place-order", {
                         "symbol":sym,"productType":PRODUCT_TYPE,
                         "marginMode":"isolated","marginCoin":MARGIN_COIN,
-                        "size":fmt_q(sym, qty_l),"side":order_side,
-                        "tradeSide":"open","orderType":"market","force":"ioc",
+                        "size":fmt_q(sym, qty_trade),"side":order_side,
+                        "tradeSide":trade_side,"orderType":"market","force":"ioc",
                     })
                     ok = resp.get("code") == "00000"
-                    if ok and side_label=="SELL": pnl += qty_l * step
+                    if ok:
+                        if side_label == "BUY":
+                            net_qty += qty_l
+                        else:
+                            pnl     += qty_trade * step
+                            net_qty  = max(0.0, net_qty - qty_trade)
                     with plock:
                         gi = pstate["grid_instances"].get(inst_id,{})
                         if "grid_orders" in gi and i < len(gi["grid_orders"]):
@@ -1446,27 +1513,28 @@ def run_grid_instance(flag, inst_cfg, inst_id):
     _ilog(inst_id, name, "Gestoppt.")
 
 def start_grid_instance(inst_id):
-    cfg  = load_config()
-    inst = next((i for i in cfg.get("grid_instances",[]) if i["id"]==inst_id), None)
-    if not inst:     return False, "Instanz nicht gefunden"
-    if not inst.get("api_key") or not inst.get("api_secret"):
-        return False, "API Key / Secret fehlt"
-    if inst_id in grid_inst_threads and grid_inst_threads[inst_id].is_alive():
-        return False, "Laeuft bereits"
-    with plock:
-        pstate["grid_instances"][inst_id] = {
-            "status":"STARTING","name":inst.get("name","Grid"),
-            "balance":0.0,"start_bal":0.0,"pnl":0.0,
-            "trade_count":0,"filled":0,"logs":[],"grid_orders":[],
-            "symbol":inst.get("symbol","BTCUSDT"),"upper":0,"lower":0,"last_update":"",
-        }
-    f = {"stop": False}
-    grid_inst_flags[inst_id]   = f
-    t = threading.Thread(target=run_grid_instance, args=(f,inst,inst_id), daemon=True,
-                         name=f"grid-{inst_id}")
-    grid_inst_threads[inst_id] = t
-    t.start()
-    return True, "Gestartet"
+    with _start_lock:
+        if inst_id in grid_inst_threads and grid_inst_threads[inst_id].is_alive():
+            return False, "Laeuft bereits"
+        cfg  = load_config()
+        inst = next((i for i in cfg.get("grid_instances",[]) if i["id"]==inst_id), None)
+        if not inst:     return False, "Instanz nicht gefunden"
+        if not inst.get("api_key") or not inst.get("api_secret"):
+            return False, "API Key / Secret fehlt"
+        with plock:
+            pstate["grid_instances"][inst_id] = {
+                "status":"STARTING","name":inst.get("name","Grid"),
+                "balance":0.0,"start_bal":0.0,"pnl":0.0,
+                "trade_count":0,"filled":0,"logs":[],"grid_orders":[],
+                "symbol":inst.get("symbol","BTCUSDT"),"upper":0,"lower":0,"last_update":"",
+            }
+        f = {"stop": False}
+        grid_inst_flags[inst_id]   = f
+        t = threading.Thread(target=run_grid_instance, args=(f,inst,inst_id), daemon=True,
+                             name=f"grid-{inst_id}")
+        grid_inst_threads[inst_id] = t
+        t.start()
+        return True, "Gestartet"
 
 def stop_grid_instance(inst_id):
     if inst_id in grid_inst_flags: grid_inst_flags[inst_id]["stop"] = True
@@ -1493,7 +1561,9 @@ def run_funding(flag):
     with plock:
         pstate["bots"]["funding"].update({
             "status":"RUNNING","balance":start_bal,"start_bal":start_bal})
-    blog("funding",f"Aktiv | Min FR: {min_fr*100:.4f}% | Max: {max_p} USDT")
+    blog("funding",f"Aktiv | Min FR: {min_fr*100:.4f}% | Max: {max_p} USDT | "
+                   f"HINWEIS: Beobachtungs-Modus, dieser Bot platziert KEINE echten Orders. "
+                   f"'Verdient' ist eine Schaetzung.","WARN")
 
     while not flag["stop"]:
         try:
@@ -1643,20 +1713,28 @@ def emergency_stop():
             for pos in r.get("data", []):
                 if float(pos.get("total", 0)) <= 0:
                     continue
-                sym  = pos.get("symbol","")
-                resp = client.post("/api/v2/mix/order/place-order", {
-                    "symbol": sym, "productType": PRODUCT_TYPE,
-                    "marginMode":"isolated","marginCoin":MARGIN_COIN,
-                    "size": str(pos["total"]),
-                    "side": "sell" if pos["holdSide"]=="long" else "buy",
-                    "tradeSide":"close","orderType":"market","force":"ioc",
-                })
-                if resp.get("code") == "00000":
+                sym = pos.get("symbol","")
+                ok, last_msg = False, ""
+                for close_attempt in range(3):
+                    resp = client.post("/api/v2/mix/order/place-order", {
+                        "symbol": sym, "productType": PRODUCT_TYPE,
+                        "marginMode":"isolated","marginCoin":MARGIN_COIN,
+                        "size": str(pos["total"]),
+                        "side": "sell" if pos["holdSide"]=="long" else "buy",
+                        "tradeSide":"close","orderType":"market","force":"ioc",
+                    })
+                    if resp.get("code") == "00000":
+                        ok = True
+                        break
+                    last_msg = resp.get("msg","")
+                    time.sleep(1)
+                if ok:
                     closed += 1
                     log.info(f"[PANIC] {bid}: {sym} {pos['holdSide']} geschlossen")
                 else:
                     errors += 1
-                    log.error(f"[PANIC] {bid}: {sym} Fehler {resp.get('msg','')}")
+                    log.error(f"[PANIC] {bid}: {sym} Fehler nach 3 Versuchen: {last_msg}")
+                    notify(f"[NOTFALL-STOPP] FEHLER: {bid} {sym} konnte nicht geschlossen werden: {last_msg}", True)
 
             # Alle offenen Limit-Orders stornieren (z.B. Grid-Orders)
             for sym in list(TICK_DEC.keys()):
@@ -1669,7 +1747,7 @@ def emergency_stop():
 
     summary = f"Notfall-Stopp abgeschlossen: {closed} Positionen geschlossen, {errors} Fehler."
     log.warning(summary)
-    notify(f"[DAILY SUMMARY] {summary}")
+    notify(f"[NOTFALL-STOPP] {summary}", errors > 0)
     return {"closed": closed, "errors": errors}
 
 # ─────────────────────────────────────────────
@@ -1685,8 +1763,12 @@ def daily_summary_thread():
             time.sleep((target - now).total_seconds())
 
             with plock:
-                bots      = pstate["bots"]
-                total_pnl = sum(bots[b].get("pnl",0) for b in bots)
+                bots = pstate["bots"]
+                # Funding Bot fuehrt keine echten Trades aus (reine Rate-Beobachtung) -
+                # sein "pnl" ist eine Schaetzung und wird aus der echten Gesamt-PnL ausgeschlossen.
+                real_bots = [b for b in bots if b != "funding"]
+                total_pnl = sum(bots[b].get("pnl",0) for b in real_bots)
+                funding_est = bots.get("funding",{}).get("pnl",0)
                 active    = sum(1 for b in bots if bots[b].get("status")=="RUNNING")
                 trades    = sum(bots[b].get("trade_count",0) for b in bots)
                 mode      = "LIVE 🔴" if pstate.get("live_mode") else "DEMO 🔵"
@@ -1694,7 +1776,8 @@ def daily_summary_thread():
             notify(
                 f"[DAILY SUMMARY] {datetime.now().strftime('%d.%m.%Y')}\n"
                 f"Modus: {'LIVE' if pstate.get('live_mode') else 'DEMO'}\n"
-                f"PnL gesamt: {total_pnl:+.2f} USDT\n"
+                f"PnL gesamt (Signal/Grid/DCA): {total_pnl:+.2f} USDT\n"
+                f"Funding Bot Schaetzung: {funding_est:+.2f} USDT (kein echter Trade)\n"
                 f"Aktive Bots: {active}/4\n"
                 f"Trades heute: {trades}"
             )
@@ -1709,20 +1792,21 @@ RUNNERS = {"signal":run_signal,"grid":run_grid,"funding":run_funding,"dca":run_d
 
 def start_bot(bot_id):
     if bot_id not in RUNNERS: return False, "Unbekannter Bot"
-    if bot_id in bot_threads and bot_threads[bot_id].is_alive():
-        return False, "Bot laeuft bereits"
-    cfg = load_config()
-    bc  = cfg["bots"].get(bot_id, {})
-    if not bc.get("api_key") or not bc.get("api_secret"):
-        return False, "API Key / Secret fehlt. Bitte erst in SETTINGS eintragen und SPEICHERN klicken."
-    if not bc.get("passphrase"):
-        return False, "Passphrase fehlt. Bitte in SETTINGS eintragen und SPEICHERN klicken."
-    f = {"stop": False}
-    bot_flags[bot_id] = f
-    t = threading.Thread(target=RUNNERS[bot_id], args=(f,), daemon=True, name=f"bot-{bot_id}")
-    bot_threads[bot_id] = t
-    t.start()
-    return True, "Gestartet"
+    with _start_lock:
+        if bot_id in bot_threads and bot_threads[bot_id].is_alive():
+            return False, "Bot laeuft bereits"
+        cfg = load_config()
+        bc  = cfg["bots"].get(bot_id, {})
+        if not bc.get("api_key") or not bc.get("api_secret"):
+            return False, "API Key / Secret fehlt. Bitte erst in SETTINGS eintragen und SPEICHERN klicken."
+        if not bc.get("passphrase"):
+            return False, "Passphrase fehlt. Bitte in SETTINGS eintragen und SPEICHERN klicken."
+        f = {"stop": False}
+        bot_flags[bot_id] = f
+        t = threading.Thread(target=RUNNERS[bot_id], args=(f,), daemon=True, name=f"bot-{bot_id}")
+        bot_threads[bot_id] = t
+        t.start()
+        return True, "Gestartet"
 
 def stop_bot(bot_id):
     if bot_id in bot_flags: bot_flags[bot_id]["stop"] = True
@@ -2080,7 +2164,7 @@ body.live-mode::after{content:'LIVE';position:fixed;bottom:16px;right:16px;
   <div class="grid g4">
     <div class="card"><div class="card-label">Gesamt Balance</div>
       <div class="card-value blue" id="ov-balance">0.00</div><div class="card-sub">USDT (Demo)</div></div>
-    <div class="card"><div class="card-label">Gesamt PnL</div>
+    <div class="card"><div class="card-label" title="Ohne Funding Bot - der handelt nicht real">Gesamt PnL (ohne Funding)</div>
       <div class="card-value" id="ov-pnl">+0.00</div><div class="card-sub" id="ov-pnlpct">0.00%</div></div>
     <div class="card"><div class="card-label">Aktive Bots</div>
       <div class="card-value white" id="ov-active">0 / 4</div><div class="card-sub">Laufen / Gesamt</div></div>
@@ -2336,7 +2420,7 @@ body.live-mode::after{content:'LIVE';position:fixed;bottom:16px;right:16px;
   <div class="bot-header">
     <div>
       <div class="bot-title" style="color:var(--funding)">FUNDING BOT</div>
-      <div class="bot-meta">Delta-neutral | Verdient Funding Rate ohne Markt-Exposure</div>
+      <div class="bot-meta">Beobachtungs-Modus: zeigt Funding-Rate-Opportunities, platziert aber KEINE echten Orders. "Verdient" ist eine Schaetzung.</div>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <button class="btn-help" onclick="showHelp('funding')" title="Erklaerung">?</button>
@@ -2592,6 +2676,20 @@ body.live-mode::after{content:'LIVE';position:fixed;bottom:16px;right:16px;
       </div>
     </div>
 
+    <!-- DASHBOARD ZUGANG -->
+    <div class="settings-section">
+      <div class="settings-head" onclick="toggle('s-auth')"><span>Dashboard-Zugang</span><span style="color:var(--muted)">▾</span></div>
+      <div id="s-auth" class="settings-body open">
+        <div style="background:rgba(248,113,113,.07);border:1px solid rgba(248,113,113,.2);border-radius:5px;padding:9px 12px;margin-bottom:12px;font-size:11px;color:var(--red)">
+          Beim ersten Start wurde ein zufaelliges Passwort generiert (siehe platform.log). Hier aendern und SPEICHERN nicht vergessen - danach fragt der Browser beim naechsten Laden neu nach Login.
+        </div>
+        <div class="field-row"><label>Benutzername</label>
+          <input type="text" id="cfg-dash-user" placeholder="admin"></div>
+        <div class="field-row"><label>Passwort</label>
+          <input type="text" id="cfg-dash-pass" placeholder="Leer lassen = unveraendert"></div>
+      </div>
+    </div>
+
     <!-- GLOBALE KEYS -->
     <div class="settings-section">
       <div class="settings-head" onclick="toggle('s-global')"><span>Globale API-Keys</span><span style="color:var(--muted)">▾</span></div>
@@ -2772,6 +2870,12 @@ body.live-mode::after{content:'LIVE';position:fixed;bottom:16px;right:16px;
 <script>
 const BOT_COLORS = {signal:'#00d68f',grid:'#4da6ff',funding:'#a78bfa',dca:'#fbbf24'};
 const BOT_NAMES  = {signal:'Signal Bot',grid:'Grid Bot',funding:'Funding Bot',dca:'DCA Bot'};
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
 
 // -- SPRACHE / LANGUAGE ---------------------------------------
 let _lang = (typeof localStorage !== 'undefined' && localStorage.getItem('tp_lang')) || 'de';
@@ -3863,13 +3967,13 @@ function renderKalender() {
                       e.impact==='high'        ? 'var(--dca)' : 'var(--muted)';
     const impactLbl = e.impact==='high'&&isUS  ? 'HOCH [US]' :
                       e.impact==='high'        ? 'HOCH' : 'MITTEL';
-    const cname  = COUNTRY_NAMES[e.country]||e.country||'?';
-    const actual = e.actual  != null ? String(e.actual)  : '-';
-    const est    = e.estimate!= null ? String(e.estimate): '-';
+    const cname  = esc(COUNTRY_NAMES[e.country]||e.country||'?');
+    const actual = e.actual  != null ? esc(String(e.actual))  : '-';
+    const est    = e.estimate!= null ? esc(String(e.estimate)): '-';
     return '<div class="ov-row" style="grid-template-columns:70px 50px 1fr 80px 80px 80px">' +
-      '<span style="color:var(--muted);font-size:10px">'+e.time+'</span>' +
+      '<span style="color:var(--muted);font-size:10px">'+esc(e.time)+'</span>' +
       '<span style="font-size:10px;font-weight:600;color:'+(isUS?'var(--red)':'var(--blue)')+'">'+cname+'</span>' +
-      '<span style="font-size:11px">'+e.event+'</span>' +
+      '<span style="font-size:11px">'+esc(e.event)+'</span>' +
       '<span style="font-size:10px;font-weight:700;color:'+impactCol+'">'+impactLbl+'</span>' +
       '<span style="font-size:10px;color:var(--muted)">'+actual+'</span>' +
       '<span style="font-size:10px;color:var(--dim)">'+est+'</span>' +
@@ -4037,12 +4141,12 @@ function renderAlerts() {
   list.innerHTML = _alertRules.map((a,i) => {
     const status = a.triggered ? 'AUSGELOEST' : (a.enabled ? 'AKTIV' : 'DEAKTIVIERT');
     const sCol   = a.triggered ? 'var(--dca)' : (a.enabled ? 'var(--signal)' : 'var(--muted)');
-    const sym    = a.symbol ? a.symbol+' ' : '';
+    const sym    = a.symbol ? esc(a.symbol)+' ' : '';
     return '<div style="display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border)">' +
       '<div style="flex:1">' +
-        '<div style="font-size:11px;font-weight:600;color:var(--white)">'+(a.name||'Alert '+i)+'</div>' +
+        '<div style="font-size:11px;font-weight:600;color:var(--white)">'+esc(a.name||'Alert '+i)+'</div>' +
         '<div style="font-size:10px;color:var(--muted);margin-top:2px">'+
-          (TYPE_LABELS[a.type]||a.type)+' '+sym+a.value+'</div>' +
+          esc(TYPE_LABELS[a.type]||a.type)+' '+sym+esc(a.value)+'</div>' +
       '</div>' +
       '<span style="font-size:10px;font-weight:700;color:'+sCol+'">'+status+'</span>' +
       '<button onclick="toggleAlert('+i+')" style="background:var(--dim);border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;padding:4px 10px;border-radius:4px;cursor:pointer">' +
@@ -4321,7 +4425,7 @@ function pnlColor(v) { return parseFloat(v) >= 0 ? 'green' : 'red'; }
 function renderLog(entries, maxN=40) {
   if (!entries || !entries.length) return '<span style="color:var(--muted);font-size:11px">Kein Log</span>';
   return entries.slice(0,maxN).map(e =>
-    `<div class="log-entry"><span class="lt">${e.t}</span><span class="ll ${e.l}">${e.l}</span><span style="color:#999;opacity:.8">${e.m}</span></div>`
+    `<div class="log-entry"><span class="lt">${esc(e.t)}</span><span class="ll ${esc(e.l)}">${esc(e.l)}</span><span style="color:#999;opacity:.8">${esc(e.m)}</span></div>`
   ).join('');
 }
 
@@ -4334,8 +4438,8 @@ function renderMacro(events) {
     let day = '';
     if (e.date === todayStr)    day = 'Heute ';
     else if (e.date === tomorrowStr) day = 'Morgen ';
-    else if (e.date)            day = e.date.slice(5).replace('-','.') + ' ';
-    return '<div class="me '+e.impact+'">'+day+e.time+' '+e.event+(e.country?' ['+e.country+']':'')+'</div>';
+    else if (e.date)            day = esc(e.date.slice(5).replace('-','.')) + ' ';
+    return '<div class="me '+esc(e.impact)+'">'+day+esc(e.time)+' '+esc(e.event)+(e.country?' ['+esc(e.country)+']':'')+'</div>';
   }).join('');
 }
 
@@ -4403,7 +4507,7 @@ function update(state) {
     const st  = b.status || 'STOPPED';
     if (st === 'RUNNING') activeCount++;
     totalBal    += bal;
-    totalPnl    += pnl;
+    if (id !== 'funding') totalPnl += pnl; // Funding Bot handelt nicht real, Schaetzung zaehlt nicht in den echten Gesamt-PnL
     totalTrades += parseInt(b.trade_count||0);
     return `<div class="ov-row">
       <span class="ov-bot-name" style="color:${BOT_COLORS[id]}">${BOT_NAMES[id]}</span>
@@ -4594,6 +4698,8 @@ async function toggleBot(id) {
 function fillSettingsForm(state) {
   fetch('/api/config').then(r=>r.json()).then(cfg => {
     const s = v => v != null ? String(v) : '';
+    document.getElementById('cfg-dash-user').value   = s(cfg.dashboard_user||'admin');
+    document.getElementById('cfg-dash-pass').value   = '';
     document.getElementById('cfg-finnhub').value     = s(cfg.finnhub_key);
     document.getElementById('cfg-cryptopanic').value = s(cfg.cryptopanic_key);
     document.getElementById('cfg-tg-token').value    = s(cfg.telegram_token);
@@ -4633,6 +4739,8 @@ async function saveSettings() {
   const num = id => parseFloat(val(id)) || 0;
   const int = id => parseInt(val(id))   || 0;
   const cfg = {
+    dashboard_user:     val('cfg-dash-user'),
+    dashboard_password: val('cfg-dash-pass'),
     finnhub_key:     val('cfg-finnhub'),
     cryptopanic_key: val('cfg-cryptopanic'),
     telegram_token:  val('cfg-tg-token'),
@@ -4735,12 +4843,38 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type","application/json")
-        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _check_auth(self):
+        """HTTP Basic Auth. Verhindert unauthorisierten Zugriff und CSRF: Browser
+        haengen Basic-Auth-Credentials nie automatisch an Cross-Origin-Requests an,
+        eine boesartige Seite kann also nicht per fetch()/Formular Bot-Aktionen ausloesen."""
+        cfg  = load_config()
+        user = cfg.get("dashboard_user","admin")
+        pw   = cfg.get("dashboard_password","")
+        auth = self.headers.get("Authorization","")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            decoded  = base64.b64decode(auth[6:]).decode("utf-8")
+            u, _, p  = decoded.partition(":")
+        except Exception:
+            return False
+        return hmac.compare_digest(u, user) and hmac.compare_digest(p, pw)
+
+    def _deny_auth(self):
+        body = b"Authentication required"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Trading Platform"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._check_auth():
+            self._deny_auth(); return
         if self.path == "/api/state":
             with plock:
                 state_copy = dict(pstate)
@@ -4760,7 +4894,7 @@ class Handler(BaseHTTPRequestHandler):
             with _alert_lock:
                 self._json(list(_alert_log))
         elif self.path.startswith("/api/klines"):
-            # Public klines proxy (kein Auth noetig)
+            # Klines-Proxy zu Bitget (Dashboard-Auth wird oben in do_GET bereits geprueft)
             qs     = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sym    = qs.get("symbol",["BTCUSDT"])[0]
             gran   = qs.get("granularity",["1H"])[0]
@@ -4781,15 +4915,26 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(html)
 
     def do_POST(self):
+        if not self._check_auth():
+            self._deny_auth(); return
         length = int(self.headers.get("Content-Length",0))
         body   = self.rfile.read(length).decode("utf-8")
         try:   data = json.loads(body)
         except:data = {}
+        try:
+            self._dispatch_post(data)
+        except Exception as e:
+            self._json({"status":"error","msg":f"Ungueltige Anfrage: {e}"}, 400)
 
+    def _dispatch_post(self, data):
         if self.path == "/api/config":
             cfg = load_config()
             for k in ("finnhub_key","cryptopanic_key","telegram_token","telegram_chat_id"):
                 if k in data: cfg[k] = data[k]
+            # Dashboard-Login nur ueberschreiben wenn tatsaechlich ein Wert gesendet wurde -
+            # ein leerer String wuerde sonst das Passwort effektiv aussperren.
+            if data.get("dashboard_user"):     cfg["dashboard_user"]     = str(data["dashboard_user"])
+            if data.get("dashboard_password"): cfg["dashboard_password"] = str(data["dashboard_password"])
             if "live_mode" in data:
                 cfg["live_mode"] = bool(data["live_mode"])
                 with plock:
@@ -4820,23 +4965,25 @@ class Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/backtest":
             result = run_backtest(
-                symbol       = data.get("symbol","BTCUSDT"),
-                period_days  = int(data.get("period_days", 14)),
-                leverage     = int(data.get("leverage", 3)),
-                threshold    = int(data.get("threshold", 2)),
-                sl_pct       = float(data.get("sl_pct", 0.010)),
-                tp_pct       = float(data.get("tp_pct", 0.020)),
+                symbol       = str(data.get("symbol","BTCUSDT"))[:20],
+                period_days  = max(1,   min(730, int(data.get("period_days", 14)))),
+                leverage     = max(1,   min(125, int(data.get("leverage", 3)))),
+                threshold    = max(1,   min(10,  int(data.get("threshold", 2)))),
+                sl_pct       = max(0.001, min(0.5, float(data.get("sl_pct", 0.010)))),
+                tp_pct       = max(0.001, min(1.0, float(data.get("tp_pct", 0.020)))),
                 walk_forward = bool(data.get("walk_forward", False)),
             )
             self._json(result)
 
         elif self.path == "/api/multi_backtest":
             symbols = data.get("symbols", ["BTCUSDT","ETHUSDT","SOLUSDT"])
+            if not isinstance(symbols, list): symbols = ["BTCUSDT"]
+            symbols = [str(s)[:20] for s in symbols[:10]]
             result  = run_multi_backtest(
                 symbols,
-                period_days = int(data.get("period_days", 14)),
-                leverage    = int(data.get("leverage", 3)),
-                threshold   = int(data.get("threshold", 2)),
+                period_days = max(1, min(730, int(data.get("period_days", 14)))),
+                leverage    = max(1, min(125, int(data.get("leverage", 3)))),
+                threshold   = max(1, min(10,  int(data.get("threshold", 2)))),
             )
             self._json(result)
 
@@ -4876,15 +5023,15 @@ class Handler(BaseHTTPRequestHandler):
             inst = cfg.get("grid_instances",[])
             new  = {
                 "id":         "g" + str(int(time.time())),
-                "name":        data.get("name","Grid "+str(len(inst)+2)),
+                "name":        str(data.get("name","Grid "+str(len(inst)+2)))[:60],
                 "api_key":     data.get("api_key",""),
                 "api_secret":  data.get("api_secret",""),
                 "passphrase":  data.get("passphrase",""),
-                "symbol":      data.get("symbol","BTCUSDT"),
-                "upper_price": float(data.get("upper_price",0)),
-                "lower_price": float(data.get("lower_price",0)),
-                "grid_count":  int(data.get("grid_count",10)),
-                "investment":  float(data.get("investment",100)),
+                "symbol":      str(data.get("symbol","BTCUSDT"))[:20],
+                "upper_price": max(0.0, float(data.get("upper_price",0))),
+                "lower_price": max(0.0, float(data.get("lower_price",0))),
+                "grid_count":  max(2, min(50, int(data.get("grid_count",10)))),
+                "investment":  max(0.0, float(data.get("investment",100))),
                 "check_interval": 10,
             }
             inst.append(new)
