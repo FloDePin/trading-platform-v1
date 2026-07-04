@@ -97,13 +97,19 @@ Dashboard at `http://your-server-ip:5000`
 - **`platform.log` contains the auto-generated dashboard password once, at first start.** It is gitignored too – treat it with the same care as the config file.
 
 ### Dashboard login
-The dashboard is protected with HTTP Basic Auth. On first start, a random password is
-generated automatically and printed once to the console/`platform.log`:
-```
-Dashboard-Zugang erstellt: user='admin' password='<random>'
-```
-Your browser will prompt for these credentials on the first visit. Change them anytime
-under **Settings → Dashboard-Zugang**.
+The dashboard is protected with HTTP Basic Auth.
+
+- **First start (interactive terminal):** you'll be asked to choose your own username and
+  password right in the console. Leave the password blank to auto-generate one instead.
+- **Every start after that (interactive terminal):** `python platform.py` asks you to log in
+  in the console (3 attempts) *before* the dashboard boots up, as a second gate in addition
+  to the browser's Basic Auth prompt.
+- **Headless/background start (systemd, no attached terminal):** no prompt is shown – a
+  random password is generated automatically on first run and logged once to
+  `platform.log`, exactly as before. This keeps unattended restarts (e.g. via systemd)
+  working without a TTY.
+
+Change username/password anytime under **Settings → Dashboard-Zugang** in the web UI.
 
 ### Restrict dashboard access
 ```bash

@@ -5,7 +5,7 @@ Bitget Sub-Account Support | Demo & Live
 """
 
 import time, json, hmac, hashlib, base64, logging, requests
-import urllib.parse, threading, os, math, sqlite3, sys, secrets, uuid
+import urllib.parse, threading, os, math, sqlite3, sys, secrets, uuid, getpass
 import signal as _signal
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
@@ -173,7 +173,35 @@ DEFAULT_CONFIG = {
     }
 }
 
+_credentials_just_created = False  # verhindert doppelte Abfrage direkt nach der Ersteinrichtung
+
+def _prompt_first_run_credentials():
+    """Interaktive Ersteinrichtung: laesst den Nutzer Benutzername/Passwort selbst waehlen.
+    Nur moeglich wenn ein echtes Terminal angehaengt ist (sonst Fallback auf Auto-Generierung,
+    z.B. bei systemd/Hintergrund-Diensten ohne TTY)."""
+    print("="*55)
+    print("  Ersteinrichtung: Dashboard-Zugang festlegen")
+    print("="*55)
+    try:
+        user = input("  Benutzername [admin]: ").strip() or "admin"
+        pw1  = getpass.getpass("  Passwort (leer = automatisch generieren): ").strip()
+        if not pw1:
+            pw1 = secrets.token_urlsafe(12)
+            print(f"  Generiertes Passwort: {pw1}")
+        else:
+            pw2 = getpass.getpass("  Passwort wiederholen: ").strip()
+            if pw2 != pw1:
+                pw1 = secrets.token_urlsafe(12)
+                print(f"  Passwoerter stimmten nicht ueberein - generiere stattdessen eins: {pw1}")
+        print("="*55)
+        return user, pw1
+    except (EOFError, KeyboardInterrupt):
+        pw = secrets.token_urlsafe(12)
+        print(f"\n  Eingabe abgebrochen - generiertes Passwort: {pw}")
+        return "admin", pw
+
 def load_config():
+    global _credentials_just_created
     is_new = not os.path.exists(CONFIG_FILE)
     if is_new:
         data = DEFAULT_CONFIG.copy()
@@ -191,10 +219,16 @@ def load_config():
 
     needs_save = is_new
     if not data.get("dashboard_password"):
-        data["dashboard_password"] = secrets.token_urlsafe(12)
+        if sys.stdin.isatty():
+            user, pw = _prompt_first_run_credentials()
+            data["dashboard_user"]     = user
+            data["dashboard_password"] = pw
+        else:
+            data["dashboard_password"] = secrets.token_urlsafe(12)
         needs_save = True
+        _credentials_just_created = True
         log.warning("="*55)
-        log.warning(f"  Dashboard-Zugang erstellt: user='{data.get('dashboard_user','admin')}' "
+        log.warning(f"  Dashboard-Zugang: user='{data.get('dashboard_user','admin')}' "
                     f"password='{data['dashboard_password']}'")
         log.warning("  Bitte merken/aendern (Settings -> Dashboard-Zugang).")
         log.warning("="*55)
@@ -204,6 +238,32 @@ def load_config():
         if is_new:
             log.info(f"Config erstellt: {CONFIG_FILE}")
     return data
+
+def _verify_login_at_startup(cfg):
+    """Fragt bei jedem Start (ausser direkt nach der Ersteinrichtung) Benutzername/Passwort
+    im Terminal ab, bevor die Plattform hochfaehrt. Nur bei angehaengtem Terminal aktiv -
+    Hintergrund-Dienste (systemd etc.) ohne TTY starten weiterhin ohne Abfrage."""
+    user = cfg.get("dashboard_user", "admin")
+    pw   = cfg.get("dashboard_password", "")
+    print("="*55)
+    print("  Login")
+    print("="*55)
+    for attempt in range(3):
+        try:
+            u = input("  Benutzername: ").strip()
+            p = getpass.getpass("  Passwort: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Abgebrochen.")
+            sys.exit(1)
+        if hmac.compare_digest(u, user) and hmac.compare_digest(p, pw):
+            print("  Login OK.")
+            print("="*55)
+            return
+        remaining = 2 - attempt
+        if remaining > 0:
+            print(f"  Falsch. Noch {remaining} Versuch(e).")
+    print("  Zu viele Fehlversuche - Start abgebrochen.")
+    sys.exit(1)
 
 def save_config(cfg):
     with open(CONFIG_FILE, "w") as f:
@@ -5099,6 +5159,8 @@ if __name__ == "__main__":
     log.info("="*55)
 
     cfg = load_config()
+    if sys.stdin.isatty() and not _credentials_just_created:
+        _verify_login_at_startup(cfg)
     log.info(f"Config: {CONFIG_FILE}")
     log.info(f"Modus: {'LIVE' if cfg.get('live_mode') else 'DEMO'}")
     log.info(f"Dashboard: http://localhost:{DASHBOARD_PORT}")
