@@ -6,15 +6,29 @@ An open-source, self-hosted multi-bot trading platform for Bitget Futures & Spot
 
 ---
 
+## What's New
+
+A full security and correctness review (2026-07) fixed a number of issues and hardened the platform:
+
+- **Dashboard login.** The dashboard and its whole API now require a login (HTTP Basic Auth). On first interactive start you choose your own username/password in the console; every start after that asks you to log in in the terminal too, before the server even boots. Headless/systemd starts are unaffected (auto-generated password, no prompt, so unattended restarts keep working). See [Security](#security) below.
+- **Order safety.** Orders now carry an idempotency key (`clientOid`), so a retried request after a network hiccup can no longer place the same order twice. Starting a bot (or grid instance) twice in quick succession can no longer spawn duplicate bot threads.
+- **Grid Bot accounting fixed.** The Grid Bot now tracks what it actually bought and only closes real positions instead of opening a new one on every single level trigger – exposure is bounded by your configured investment again, and displayed PnL reflects real closes.
+- **Signal Bot streak tracking fixed.** A dead code path meant win/loss streaks and trade-history logging for SL/TP-closed positions silently never ran; this is now fixed.
+- **Funding Bot is clearly labeled as monitoring-only.** It tracks funding-rate opportunities and estimates potential yield, but places no real orders. Its estimated PnL is now excluded from the real aggregate PnL, alerts, and the daily summary so it can't be mistaken for actual trading profit.
+- **More resilient panic button.** Emergency Stop now retries a failed position close instead of giving up after one attempt, and alerts you by name if a position still couldn't be closed.
+- **Stored-XSS fixes** in alert names, bot logs, and the economic calendar; input validation/bounds on the API (backtest period, leverage, grid size) so malformed requests return a clean error instead of crashing a request.
+
+---
+
 ## What it does
 
-Runs up to 4 automated trading bots simultaneously, each on its own Bitget sub-account, controlled through a local browser dashboard. Supports both demo (paper trading) and live mode.
+Runs up to 4 automated trading bots simultaneously, each on its own Bitget sub-account, controlled through a local browser dashboard secured with a login. Supports both demo (paper trading) and live mode.
 
-**Signal Bot** – Technical analysis across multiple tokens. Scores 9 indicators and enters long/short positions when the threshold is reached.
+**Signal Bot** – Technical analysis across multiple tokens. Scores 9 indicators and enters long/short positions when the threshold is reached, with ATR-based stop loss/take profit.
 
-**Grid Bot** – Places a grid of buy/sell orders across a price range. Profits from sideways markets.
+**Grid Bot** – Places a grid of buy/sell orders across a price range and closes what it actually bought. Profits from sideways markets. Supports multiple independent grid instances at once.
 
-**Funding Bot** – Tracks funding rate opportunities across tokens for delta-neutral strategies.
+**Funding Bot** – Monitoring only: tracks funding rate opportunities across tokens and estimates potential delta-neutral yield. Does not place real orders.
 
 **DCA Bot** – Dollar-cost averaging on the Bitget spot market. Buys a fixed amount at regular intervals.
 
@@ -28,11 +42,15 @@ Runs up to 4 automated trading bots simultaneously, each on its own Bitget sub-a
 - Position sizing as % of balance
 - Correlation check: max N simultaneous positions
 - Win/Loss streak tracking
+- Order placement is idempotent (safe against duplicate orders on retry)
+- Grid Bot tracks its own position and only closes what it bought (bounded exposure)
 - Multi-Grid: multiple independent grid instances
+- Emergency Stop retries failed position closes and reports which symbol failed
 
 ### Dashboard
+- Login-protected (HTTP Basic Auth) – guided setup on first start, changeable in Settings
 - Real-time overview with Fear & Greed history chart (30 days)
-- Per-bot PnL sparklines and status
+- Per-bot PnL sparklines and status (Funding Bot's estimate shown separately, excluded from the real total)
 - Open positions across all sub-accounts
 - Market tab: live prices for 15+ coins
 - Economic Calendar with Finnhub
@@ -138,7 +156,7 @@ Cryptocurrency trading involves significant financial risk. You can lose all all
 ## Architecture
 
 ```
-platform.py             Single-file application (~5000 lines)
+platform.py             Single-file application (~5200 lines)
 platform_config.json    API keys and settings (gitignored)
 platform.db             SQLite: trade history + PnL snapshots
 platform.log            Rotating log (5 MB)
