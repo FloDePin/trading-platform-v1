@@ -10,19 +10,19 @@ An open-source, self-hosted multi-bot trading platform for Bitget Futures & Spot
 
 A full security and correctness review (2026-07) fixed a number of issues and hardened the platform:
 
-- **Dashboard login.** The dashboard and its whole API now require a login (HTTP Basic Auth). On first interactive start you choose your own username/password in the console; every start after that asks you to log in in the terminal too, before the server even boots. Headless/systemd starts are unaffected (auto-generated password, no prompt, so unattended restarts keep working). See [Security](#security) below.
-- **Order safety.** Orders now carry an idempotency key (`clientOid`), so a retried request after a network hiccup can no longer place the same order twice. Starting a bot (or grid instance) twice in quick succession can no longer spawn duplicate bot threads.
-- **Grid Bot accounting fixed.** The Grid Bot now tracks what it actually bought and only closes real positions instead of opening a new one on every single level trigger – exposure is bounded by your configured investment again, and displayed PnL reflects real closes.
+- **Dashboard login.** The dashboard and its whole API now require a login (HTTP Basic Auth). On first interactive start you choose your own username/password in the console; every start after that asks for the password before the dashboard boots.
+- **Order safety.** Orders now carry an idempotency key (`clientOid`), so a retried request after a network hiccup can no longer place the same order twice. Starting a bot (or grid instance) twice is now safe.
+- **Grid Bot accounting fixed.** The Grid Bot now tracks what it actually bought and only closes real positions instead of opening a new one on every single level trigger – exposure is bounded by design.
 - **Signal Bot streak tracking fixed.** A dead code path meant win/loss streaks and trade-history logging for SL/TP-closed positions silently never ran; this is now fixed.
-- **Funding Bot is clearly labeled as monitoring-only.** It tracks funding-rate opportunities and estimates potential yield, but places no real orders. Its estimated PnL is now excluded from the real aggregate PnL, alerts, and the daily summary so it can't be mistaken for actual trading profit.
+- **Funding Bot is clearly labeled as monitoring-only.** It tracks funding-rate opportunities and estimates potential yield, but places no real orders. Its estimated PnL is now excluded from the reported total.
 - **More resilient panic button.** Emergency Stop now retries a failed position close instead of giving up after one attempt, and alerts you by name if a position still couldn't be closed.
-- **Stored-XSS fixes** in alert names, bot logs, and the economic calendar; input validation/bounds on the API (backtest period, leverage, grid size) so malformed requests return a clean error instead of crashing a request.
+- **Stored-XSS fixes** in alert names, bot logs, and the economic calendar; input validation/bounds on the API (backtest period, leverage, grid size) so malformed requests return a clean error instead of crashing.
 
 ---
 
 ## What it does
 
-Runs up to 4 automated trading bots simultaneously, each on its own Bitget sub-account, controlled through a local browser dashboard secured with a login. Supports both demo (paper trading) and live mode.
+Runs up to 4 automated trading bots simultaneously, each on its own Bitget sub-account, controlled through a local browser dashboard secured with a login. Supports both demo (paper trading) and live trading.
 
 **Signal Bot** – Technical analysis across multiple tokens. Scores 9 indicators and enters long/short positions when the threshold is reached, with ATR-based stop loss/take profit.
 
@@ -107,6 +107,32 @@ Dashboard at `http://your-server-ip:5000`
 
 ## Security
 
+### Why this platform is safe: 100% Open Source + Local Execution
+
+This platform is **fundamentally different** from cloud-based trading services:
+
+#### ✅ Complete Transparency
+- **Full source code on GitHub.** Every line of code is auditable. There are no hidden algorithms, no black boxes, no cloud backend collecting data.
+- **Single Python file (~5200 lines).** All logic is in one readable file (`platform.py`). You can read and understand exactly what it does.
+- **MIT License.** Completely free to use, modify, and distribute. You own it.
+
+#### ✅ Never Leaves Your Computer
+- **All processing is local.** Backtesting, calculations, bot logic, dashboard – all run on *your* machine.
+- **API keys never leave your PC.** They are stored locally in `platform_config.json` (gitignored). Your keys are never sent to any server except directly to Bitget's official API endpoint (`api.bitget.com`).
+- **No account needed.** No sign-up, no phone verification, no account closure risk, no terms of service changing overnight.
+- **No dependency on external services for core trading.** The only external calls are:
+  - `api.bitget.com` – your exchange API
+  - `finnhub.io` – free market data (optional, for Economic Calendar)
+  - `api.coingecko.com` – sentiment data (optional)
+  - `api.alternative.me` – Fear & Greed index (optional)
+  
+  All optional integrations can be disabled. **Core trading works offline except for exchange connectivity.**
+
+#### ✅ No Surveillance, No Fees, No Intermediary
+- You trade directly with Bitget – no middleware, no commission markup, no data collection.
+- No advertisements, no upselling, no premium tiers.
+- Run it on a local machine, a home server, a cheap VPS – your choice. No vendor lock-in.
+
 ### Critical rules
 - **Never use your main Bitget account.** Use sub-accounts with limited balance.
 - **API keys: Read + Trade only.** Never enable Withdraw.
@@ -142,6 +168,8 @@ Or use [Tailscale](https://tailscale.com) for zero-config private VPN access.
 - Never transmits keys to external services
 - Never makes trades outside configured bot logic
 - All API calls go to `api.bitget.com` only
+- Never phones home for licensing, telemetry, or analytics
+- Never requires internet connectivity except for exchange communication
 
 ---
 
@@ -176,7 +204,7 @@ Copyright (c) 2026 Trading Platform Contributors
 
 Before running the Grid Bot, you **must** switch your Bitget sub-account from Hedge Mode to **One-Way Mode**.
 
-**Why:** Bitget Futures defaults to Hedge Mode (simultaneous long and short allowed). In Hedge Mode, the Grid Bot's sell orders open new short positions instead of closing existing longs. This ca[...]
+**Why:** Bitget Futures defaults to Hedge Mode (simultaneous long and short allowed). In Hedge Mode, the Grid Bot's sell orders open new short positions instead of closing existing longs. This causes unintended short exposure. One-Way Mode ensures all sell orders close existing long positions.
 
 **How to switch:**
 1. Open Bitget App or website
@@ -193,7 +221,7 @@ Currently, the platform is built exclusively for **Bitget** (Futures + Spot). Th
 
 ### Adding More Exchanges (Roadmap)
 
-The platform is designed so that the `BitgetClient` class can be replaced with a universal exchange wrapper using [CCXT](https://github.com/ccxt/ccxt) – a Python library that supports 100+ exch[...]
+The platform is designed so that the `BitgetClient` class can be replaced with a universal exchange wrapper using [CCXT](https://github.com/ccxt/ccxt) – a Python library that supports 100+ exchanges with a unified API.
 
 Planned exchanges for future support:
 
