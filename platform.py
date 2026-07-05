@@ -1549,7 +1549,8 @@ def run_grid_instance(flag, inst_cfg, inst_id):
                         gi["filled"]      = sum(filled)
                         gi["trade_count"] = sum(filled)
                         gi["pnl"]         = round(pnl,4)
-                    _ilog(inst_id, name, f"Grid {side_label} @ {level:.2f} L{i+1}/{n}",
+                    istatus = "OK" if ok else f"Fehler {resp.get('msg','')}"
+                    _ilog(inst_id, name, f"Grid {side_label} @ {level:.2f} L{i+1}/{n} {istatus}",
                           "TRADE" if ok else "ERROR")
                 elif filled[i] and abs(px - level)/level > 0.005:
                     filled[i] = False
@@ -4263,7 +4264,7 @@ async function loadAlertLog() {
     const r = await fetch('/api/alert_log');
     const d = await r.json();
     document.getElementById('al-log').innerHTML = d.length
-      ? d.map(e=>'<div class="log-entry"><span class="lt">'+e.t+'</span><span style="color:var(--dca)">ALERT</span><span style="color:#aaa">'+e.m+'</span></div>').join('')
+      ? d.map(e=>'<div class="log-entry"><span class="lt">'+esc(e.t)+'</span><span style="color:var(--dca)">ALERT</span><span style="color:#aaa">'+esc(e.m)+'</span></div>').join('')
       : '<div style="padding:12px;color:var(--muted);font-size:11px">Noch keine Alerts ausgeloest.</div>';
   } catch(e) {}
 }
@@ -5061,8 +5062,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"open": _circuit_open, "until": _circuit_until})
 
         elif self.path == "/api/alerts/save":
+            raw = data.get("alerts", [])
+            if not isinstance(raw, list): raw = []
+            clean = []
+            for a in raw[:100]:
+                if not isinstance(a, dict): continue
+                clean.append({
+                    "id":        str(a.get("id",""))[:40],
+                    "name":      str(a.get("name",""))[:80],
+                    "type":      str(a.get("type",""))[:40],
+                    "symbol":    str(a.get("symbol",""))[:20],
+                    "value":     a.get("value", 0) if isinstance(a.get("value"), (int,float)) else 0,
+                    "enabled":   bool(a.get("enabled", True)),
+                    "triggered": bool(a.get("triggered", False)),
+                })
             cfg = load_config()
-            cfg["alerts"] = data.get("alerts", [])
+            cfg["alerts"] = clean
             save_config(cfg)
             self._json({"status":"ok"})
 
