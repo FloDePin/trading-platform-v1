@@ -1,8 +1,16 @@
-# Trading Platform v1
+<div align="center">
 
-An open-source, self-hosted multi-bot trading platform for Bitget Futures & Spot, with a real-time web dashboard. Built in pure Python – no cloud, no subscription, no middleman.
+# 📈 Trading Platform v1
 
-![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Demo Mode](https://img.shields.io/badge/default-demo%20mode-orange)
+**Self-hosted multi-bot trading platform for Bitget Futures & Spot, by FloDePin**
+
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://python.org) [![Demo Mode](https://img.shields.io/badge/default-demo%20mode-orange)](#installation)
+
+🇬🇧 **English** | 🇩🇪 [Deutsch](README.de.md)
+
+*An open-source, self-hosted multi-bot trading platform for Bitget Futures & Spot, with a real-time web dashboard. Built in pure Python – no cloud, no subscription, no middleman.*
+
+</div>
 
 ---
 
