@@ -306,7 +306,7 @@ class BitgetClient:
                     log.warning("Rate limit erreicht – warte 5s")
                     time.sleep(5); continue
                 return r.json()
-            except Exception as e:
+            except Exception:
                 if attempt < retries - 1: time.sleep(2)
         return {}
 
@@ -324,7 +324,7 @@ class BitgetClient:
                     headers=self._hdrs(ts, self._sign(ts,"POST",path,b)),
                     data=b, timeout=10)
                 return r.json()
-            except Exception as e:
+            except Exception:
                 if attempt < retries - 1: time.sleep(2)
         return {}
 
@@ -1281,7 +1281,7 @@ def run_signal(flag):
                         return px + sl_dist, px - tp_dist
 
                     def _open(direction):
-                        nonlocal win_streak, loss_streak, open_pos_count
+                        nonlocal open_pos_count
                         if open_pos_count >= max_conc:
                             blog("signal",f"{cur}: Max. Positionen ({max_conc}) erreicht – kein neuer Trade","WARN")
                             return
@@ -1832,7 +1832,6 @@ def daily_summary_thread():
                 funding_est = bots.get("funding",{}).get("pnl",0)
                 active    = sum(1 for b in bots if bots[b].get("status")=="RUNNING")
                 trades    = sum(bots[b].get("trade_count",0) for b in bots)
-                mode      = "LIVE 🔴" if pstate.get("live_mode") else "DEMO 🔵"
 
             notify(
                 f"[DAILY SUMMARY] {datetime.now().strftime('%d.%m.%Y')}\n"
